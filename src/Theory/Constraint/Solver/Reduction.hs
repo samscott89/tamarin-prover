@@ -1,4 +1,5 @@
 {-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE ViewPatterns  #-}
 -- |
 -- Copyright   : (c) 2010-2012 Benedikt Schmidt & Simon Meier
@@ -76,6 +77,7 @@ import           Prelude                                 hiding (id, (.))
 import qualified Data.Foldable                           as F
 import qualified Data.Map                                as M
 import qualified Data.Set                                as S
+import           Data.List                               (mapAccumL)
 import           Safe
 
 import           Control.Basics
@@ -561,12 +563,17 @@ conjoinSystem sys = do
     joinSets sEdges
     F.mapM_ insertLast                 $ get sLastAtom    sys
     F.mapM_ (uncurry insertLess)       $ get sLessAtoms   sys
-    mapM_   (uncurry insertGoalStatus) $ M.toList $ get sGoals sys
+    -- split-goals are not valid anymore
+    mapM_   (uncurry insertGoalStatus) $ filter (not . isSplitGoal . fst) $ M.toList $ get sGoals sys
     F.mapM_ insertFormula $ get sFormulas sys
     -- update nodes
     _ <- (setNodes . (M.toList (get sNodes sys) ++) . M.toList) =<< getM sNodes
     -- conjoin equation store
-    modM sConjDisjEqs (`mappend` get sConjDisjEqs sys)
+    eqs <- getM sEqStore
+    let (eqs',splitIds) = (mapAccumL addDisj eqs (map snd . getConj $ get sConjDisjEqs sys))
+    setM sEqStore eqs'
+    -- add split-goals for all disjunctions of sys
+    mapM_   (`insertGoal` False) $ SplitG <$> splitIds
     void (solveSubstEqs SplitNow $ get sSubst sys)
     -- Propagate substitution changes. Ignore change indicator, as it is
     -- assumed to be 'Changed' by default.
@@ -574,8 +581,6 @@ conjoinSystem sys = do
   where
     joinSets :: Ord a => (System :-> S.Set a) -> Reduction ()
     joinSets proj = modM proj (`S.union` get proj sys)
-
-
 
 -- Unification via the equation store
 -------------------------------------
@@ -658,7 +663,7 @@ solveRuleConstraints (Just eqConstr) = do
     (eqs, splitId) <- addRuleVariants eqConstr <$> getM sEqStore
     insertGoal (SplitG splitId) False
     -- do not use expensive substCreatesNonNormalTerms here
-    setM sEqStore =<< simp hnd (const False) eqs
+    setM sEqStore =<< simp hnd (const (const False)) eqs
     noContradictoryEqStore
 solveRuleConstraints Nothing = return ()
 

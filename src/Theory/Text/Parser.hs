@@ -11,10 +11,10 @@ module Theory.Text.Parser (
     parseOpenTheory
   , parseOpenTheoryString
   , parseLemma
-  , parseIntruderRulesDH
 
   -- * Cached Message Deduction Rule Variants
-  , intruderVariantsFile
+  , dhIntruderVariantsFile
+  , bpIntruderVariantsFile
   , addMessageDeductionRuleVariants
   ) where
 
@@ -61,8 +61,8 @@ parseOpenTheory :: [String] -- ^ Defined flags
 parseOpenTheory flags = parseFile (theory flags)
 
 -- | Parse DH intruder rules.
-parseIntruderRulesDH :: FilePath -> IO [IntrRuleAC]
-parseIntruderRulesDH = parseFile (setState dhMaudeSig >> many intrRule)
+parseIntruderRules :: MaudeSig -> FilePath -> IO [IntrRuleAC]
+parseIntruderRules msig = parseFile (setState msig >> many intrRule)
 
 -- | Parse a security protocol theory from a string.
 parseOpenTheoryString :: [String]  -- ^ Defined flags.
@@ -83,10 +83,10 @@ llit = asum [freshTerm <$> freshName, pubTerm <$> pubName, varTerm <$> msgvar]
 
 -- | Lookup the arity of a non-ac symbol. Fails with a sensible error message
 -- if the operator is not known.
-lookupNonACArity :: String -> Parser Int
-lookupNonACArity op = do
+lookupArity :: String -> Parser Int
+lookupArity op = do
     maudeSig <- getState
-    case lookup (BC.pack op) (S.toList $ allFunctionSymbols maudeSig) of
+    case lookup (BC.pack op) (S.toList (noEqFunSyms maudeSig)++ [(emapSymString, 2)]) of
         Nothing -> fail $ "unknown operator `" ++ op ++ "'"
         Just k  -> return k
 
@@ -94,7 +94,7 @@ lookupNonACArity op = do
 naryOpApp :: Ord l => Parser (Term l) -> Parser (Term l)
 naryOpApp plit = do
     op <- identifier
-    k  <- lookupNonACArity op
+    k  <- lookupArity op
     ts <- parens $ if k == 1
                      then return <$> tupleterm plit
                      else commaSep (multterm plit)
@@ -102,18 +102,19 @@ naryOpApp plit = do
     when (k /= k') $
         fail $ "operator `" ++ op ++"' has arity " ++ show k ++
                ", but here it is used with arity " ++ show k'
-    return $ fAppNonAC (BC.pack op, k') ts
+    let app o = if BC.pack op == emapSymString then fAppC EMap else fAppNoEq o
+    return $ app (BC.pack op, k') ts
 
 -- | Parse a binary operator written as @op{arg1}arg2@.
 binaryAlgApp :: Ord l => Parser (Term l) -> Parser (Term l)
 binaryAlgApp plit = do
     op <- identifier
-    k <- lookupNonACArity op
+    k <- lookupArity op
     arg1 <- braced (tupleterm plit)
     arg2 <- term plit
     when (k /= 2) $ fail $
       "only operators of arity 2 can be written using the `op{t1}t2' notation"
-    return $ fAppNonAC (BC.pack op, 2) [arg1, arg2]
+    return $ fAppNoEq (BC.pack op, 2) [arg1, arg2]
 
 -- | Parse a term.
 term :: Ord l => Parser (Term l) -> Parser (Term l)
@@ -132,8 +133,8 @@ term plit = asum
     nullaryApp = do
       maudeSig <- getState
       -- FIXME: This try should not be necessary.
-      asum [ try (symbol (BC.unpack sym)) *> pure (fApp (NonAC (sym,0)) [])
-           | (sym,0) <- S.toList $ allFunctionSymbols maudeSig ]
+      asum [ try (symbol (BC.unpack sym)) *> pure (fApp (NoEq (sym,0)) [])
+           | NoEq (sym,0) <- S.toList $ funSyms maudeSig ]
 
 -- | A left-associative sequence of exponentations.
 expterm :: Ord l => Parser (Term l) -> Parser (Term l)
@@ -144,15 +145,15 @@ multterm :: Ord l => Parser (Term l) -> Parser (Term l)
 multterm plit = do
     dh <- enableDH <$> getState
     if dh -- if DH is not enabled, do not accept 'multterm's and 'expterm's
-        then chainl1 (expterm plit) ((\a b -> fAppMult [a,b]) <$ opMult)
+        then chainl1 (expterm plit) ((\a b -> fAppAC Mult [a,b]) <$ opMult)
         else msetterm plit
 
 -- | A left-associative sequence of multiset unions.
 msetterm :: Ord l => Parser (Term l) -> Parser (Term l)
 msetterm plit = do
-    mset <- enableMultiset <$> getState
+    mset <- enableMSet <$> getState
     if mset -- if multiset is not enabled, do not accept 'msetterms's
-        then chainl1 (term plit) ((\a b -> fAppUnion [a,b]) <$ opPlus)
+        then chainl1 (term plit) ((\a b -> fAppAC Union [a,b]) <$ opPlus)
         else term plit
 
 -- | A right-associative sequence of tuples.
@@ -540,6 +541,8 @@ builtins =
     builtinTheory = asum
       [ try (symbol "diffie-hellman")
           *> extendSig dhMaudeSig
+      , try (symbol "bilinear-pairing")
+          *> extendSig bpMaudeSig
       , try (symbol "multiset")
           *> extendSig msetMaudeSig
       , try (symbol "symmetric-encryption")
@@ -560,12 +563,12 @@ functions =
         f   <- BC.pack <$> identifier <* opSlash
         k   <- fromIntegral <$> natural
         sig <- getState
-        case lookup f (S.toList $ allFunctionSymbols sig) of
+        case lookup f [ o | o <- (S.toList $ stFunSyms sig)] of
           Just k' | k' /= k ->
             fail $ "conflicting arities " ++
                    show k' ++ " and " ++ show k ++
                    " for `" ++ BC.unpack f
-          _ -> setState (addFunctionSymbol (f,k) sig)
+          _ -> setState (addFunSym (f,k) sig)
 
 equations :: Parser ()
 equations =
@@ -655,25 +658,34 @@ theory flags0 = do
 ------------------------------------------------------------------------------
 
 -- | The name of the intruder variants file.
-intruderVariantsFile :: FilePath
-intruderVariantsFile = "intruder_variants_dh.spthy"
+dhIntruderVariantsFile :: FilePath
+dhIntruderVariantsFile = "intruder_variants_dh.spthy"
+
+-- | The name of the intruder variants file.
+bpIntruderVariantsFile :: FilePath
+bpIntruderVariantsFile = "intruder_variants_bp.spthy"
 
 -- | Add the variants of the message deduction rule. Uses the cached version
 -- of the @"intruder_variants_dh.spthy"@ file for the variants of the message
 -- deduction rules for Diffie-Hellman exponentiation.
 addMessageDeductionRuleVariants :: OpenTheory -> IO OpenTheory
 addMessageDeductionRuleVariants thy0
-  | enableDH msig = do
-      variantsFile <- getDataFileName intruderVariantsFile
-      ifM (doesFileExist variantsFile)
-          (do dhVariants <- parseIntruderRulesDH variantsFile
-              return $ addIntrRuleACs dhVariants thy
-          )
-          (error $ "could not find intruder message deduction theory '"
-                     ++ variantsFile ++ "'")
-  | otherwise = return thy
+  | enableBP msig = addIntruderVariants [ dhIntruderVariantsFile
+                                        , bpIntruderVariantsFile ]
+  | enableDH msig = addIntruderVariants [ dhIntruderVariantsFile ]
+  | otherwise     = return thy
   where
     msig         = get (sigpMaudeSig . thySignature) thy0
     rules        = subtermIntruderRules msig ++ specialIntruderRules
-                   ++ if enableMultiset msig then multisetIntruderRules else []
+                   ++ if enableMSet msig then multisetIntruderRules else []
     thy          = addIntrRuleACs rules thy0
+    addIntruderVariants files = do
+        ruless <- mapM loadRules files
+        return $ addIntrRuleACs (concat ruless) thy
+      where
+        loadRules file = do
+            variantsFile <- getDataFileName file
+            ifM (doesFileExist variantsFile)
+                (parseIntruderRules msig variantsFile)
+                (error $ "could not find intruder message deduction theory '"
+                           ++ variantsFile ++ "'")

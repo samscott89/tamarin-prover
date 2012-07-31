@@ -32,9 +32,11 @@ module Theory.Tools.EquationStore (
   -- ** Adding equalities
   , addEqs
   , addRuleVariants
+  , addDisj
 
   -- ** Case splitting
   , performSplit
+  , dropNameHintsBound
 
   , splits
   , splitSize
@@ -53,6 +55,7 @@ import           Term.Unification
 import           Theory.Text.Pretty
 
 import           Control.Monad.Fresh
+import           Control.Monad.Bind
 import           Control.Monad.Reader
 import           Extension.Prelude
 import           Utils.Misc
@@ -120,9 +123,17 @@ eqsIsFalse :: EqStore -> Bool
 eqsIsFalse = any ((S.empty == ) . snd) . getConj . L.get eqsConj
 
 -- | The false conjunction. It is always identified with split number -1.
-falseEqConstrConj :: Conj (SplitId, S.Set (LNSubstVFresh))
+falseEqConstrConj :: Conj (SplitId, S.Set LNSubstVFresh)
 falseEqConstrConj = Conj [ (SplitId (-1), S.empty) ]
 
+dropNameHintsBound :: EqStore -> EqStore
+dropNameHintsBound = modify eqsConj (Conj . map (second (S.map dropNameHintsLNSubstVFresh)) . getConj)
+
+dropNameHintsLNSubstVFresh :: LNSubstVFresh -> LNSubstVFresh
+dropNameHintsLNSubstVFresh subst =
+    substFromListVFresh $ zip (map fst slist)
+                              ((`evalFresh` nothingUsed) . (`evalBindT` noBindings) $ renameDropNamehint (map snd slist))
+  where slist = substToListVFresh subst
 
 -- Instances
 ------------
@@ -133,6 +144,7 @@ instance Apply SplitId where
 instance HasFrees EqStore where
     foldFrees f (EqStore subst substs nextSplitId) =
         foldFrees f subst <> foldFrees f substs <> foldFrees f nextSplitId
+    foldFreesOcc  _ _ = const mempty
     mapFrees f (EqStore subst substs nextSplitId) =
         EqStore <$> mapFrees f subst
                 <*> mapFrees f substs
@@ -157,7 +169,7 @@ splits :: EqStore -> [SplitId]
 splits eqs = map fst $ nub $ sortOn snd
     [ (idx, S.size conj) | (idx, conj) <- getConj $ L.get eqsConj eqs ]
 
--- | Returns the number of cases for a given 'SplitId'.
+-- | Returns 'True' if the 'SplitId' is valid.
 splitExists :: EqStore -> SplitId -> Bool
 splitExists eqs = isJust . splitSize eqs
 
@@ -295,7 +307,7 @@ constrainedVarsPos eqStore k
 --   names for variables from the underlying 'MonadFresh'.
 simpDisjunction :: MonadFresh m
                 => MaudeHandle
-                -> (LNSubstVFresh -> Bool)
+                -> (LNSubst -> LNSubstVFresh -> Bool)
                 -> Disj LNSubstVFresh
                 -> m (LNSubst, Maybe [LNSubstVFresh])
 simpDisjunction hnd isContr disj0 = do
@@ -314,7 +326,7 @@ simpDisjunction hnd isContr disj0 = do
 ----------------------------------------------------------------------
 
 -- | @simp eqStore@ simplifies the equation store.
-simp :: MonadFresh m => MaudeHandle -> (LNSubstVFresh -> Bool) -> EqStore -> m EqStore
+simp :: MonadFresh m => MaudeHandle -> (LNSubst -> LNSubstVFresh -> Bool) -> EqStore -> m EqStore
 simp hnd isContr eqStore =
     execStateT (whileTrue (simp1 hnd isContr))
                (trace (show ("eqStore", eqStore)) eqStore)
@@ -323,13 +335,13 @@ simp hnd isContr eqStore =
 -- | @simp1@ tries to execute one simplification step
 --   for the equation store. It returns @True@ if
 --   the equation store was modified.
-simp1 :: MonadFresh m => MaudeHandle -> (LNSubstVFresh -> Bool) -> StateT EqStore m Bool
+simp1 :: MonadFresh m => MaudeHandle -> (LNSubst -> LNSubstVFresh -> Bool) -> StateT EqStore m Bool
 simp1 hnd isContr = do
-    s <- MS.get
-    if eqsIsFalse s
+    eqs <- MS.get
+    if eqsIsFalse eqs
         then return False
         else do
-          b1 <- simpMinimize isContr
+          b1 <- simpMinimize (isContr (L.get eqsSubst eqs))
           b2 <- simpRemoveRenamings
           b3 <- simpEmptyDisj
           b4 <- foreachDisj hnd simpSingleton

@@ -38,9 +38,8 @@ import           Theory.Constraint.Solver.Contradictions (substCreatesNonNormalT
 import           Theory.Constraint.Solver.Reduction
 import           Theory.Constraint.Solver.Types
 import           Theory.Constraint.System
-import           Theory.Tools.IntruderRules (mkDUnionRule)
+import           Theory.Tools.IntruderRules (mkDUnionRule, isDExpRule, isDPMultRule, isDEMapRule)
 import           Theory.Model
-
 
 ------------------------------------------------------------------------------
 -- Extracting Goals
@@ -120,9 +119,9 @@ openGoals sys = do
     -- or KD conclusion that provides the message we are looking for as a
     -- toplevel term. If such a node exist, then solving the goal will result
     -- in at least one case where we didn't make real progress except.
-    toplevelTerms t@(destPair -> Just (t1, t2)) =
+    toplevelTerms t@(viewTerm2 -> FPair t1 t2) =
         t : toplevelTerms t1 ++ toplevelTerms t2
-    toplevelTerms t@(destInverse -> Just t1) = t : toplevelTerms t1
+    toplevelTerms t@(viewTerm2 -> FInv t1) = t : toplevelTerms t1
     toplevelTerms t = [t]
 
     deducible i m = or $ do
@@ -223,26 +222,22 @@ solveChain :: [RuleAC]              -- ^ All destruction rules.
 solveChain rules (c, p) = do
     faConc  <- gets $ nodeConcFact c
     (do -- solve it by a direct edge
+        cRule <- gets $ nodeRule (nodeConcNode c)
+        pRule <- gets $ nodeRule (nodePremNode p)
         faPrem <- gets $ nodePremFact p
+        contradictoryIf (forbiddenEdge cRule pRule)
         insertEdges [(c, faConc, faPrem, p)]
-<<<<<<< HEAD
-        let m = case kFactView faConc of
-                  Just (DnK, m') -> m'
-                  _              -> error $ "solveChain: impossible"
-            caseName (viewTerm -> FApp o _) = showFunSymName o
-=======
         let mPrem = case kFactView faConc of
                       Just (DnK, m') -> m'
                       _              -> error $ "solveChain: impossible"
-            caseName (viewTerm -> FApp o _) = show o
->>>>>>> add support for intruder reasoning about multisets
+            caseName (viewTerm -> FApp o _) = showFunSymName o
             caseName t                      = show t
         return $ caseName mPrem
      `disjunction`
      -- extend it with one step
      case kFactView faConc of
          Just (DnK, viewTerm2 -> FUnion args) ->
-             do -- If the chain starts with a union message, we
+             do -- If the chain starts at a union message, we
                 -- compute the applicable destruction rules directly.
                 i <- freshLVar "vr" LSortNode
                 let rus = map (ruleACIntrToRuleACInst . mkDUnionRule args)
@@ -250,19 +245,20 @@ solveChain rules (c, p) = do
                 -- NOTE: We rely on the check that the chain is open here.
                 ru <- disjunctionOfList rus
                 modM sNodes (M.insert i ru)
+                -- FIXME: Do we have to add the PremiseG here so it
+                -- marked as solved?
                 let v = PremIdx 0
                 faPrem <- gets $ nodePremFact (i,v)
                 extendAndMark i ru v faPrem faConc
          _ ->
-             do -- If the chain does not start with a union message,
+             do -- If the chain does not start at a union message,
                 -- the usual *DG2_chain* extension is perfomed.
                 cRule <- gets $ nodeRule (nodeConcNode c)
-                (i, ru)     <- insertFreshNode rules
-                -- contradicts normal form condition:
-                -- no edge from dexp to dexp KD premise
-                -- (this condition replaces the exp/noexp tags)
-                contradictoryIf (isDexpRule cRule && isDexpRule ru)
-                (v, faPrem) <- disjunctionOfList $ enumPrems ru
+                (i, ru) <- insertFreshNode rules
+                contradictoryIf (forbiddenEdge cRule ru)
+                -- This requires a modified chain constraint def:
+                -- path via first destruction premise of rule ...
+                (v, faPrem) <- disjunctionOfList $ take 1 $ enumPrems ru
                 extendAndMark i ru v faPrem faConc
      )
   where
@@ -272,9 +268,13 @@ solveChain rules (c, p) = do
         insertChain (i, ConcIdx 0) p
         return $ showRuleCaseName ru
 
-    isDexpRule ru = case get rInfo ru of
-        IntrInfo (DestrRule n) | n == expSymString -> True
-        _                                          -> False
+    -- contradicts normal form condition:
+    -- no edge from dexp to dexp KD premise, no edge from dpmult
+    -- to dpmult KD premise, and no edge from dpmult to demap KD premise
+    -- (this condition replaces the exp/noexp tags)
+    forbiddenEdge cRule pRule = isDExpRule   cRule && isDExpRule  pRule  ||
+                                isDPMultRule cRule && isDPMultRule pRule ||
+                                isDPMultRule cRule && isDEMapRule  pRule
 
 -- | Solve an equation split. There is no corresponding CR-rule in the rule
 -- system on paper because there we eagerly split over all variants of a rule.
